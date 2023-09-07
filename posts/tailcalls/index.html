@@ -1,0 +1,432 @@
+<!doctype html><html class="dark light"><head><meta charset=UTF-8><meta content="IE=edge" http-equiv=X-UA-Compatible><meta content="width=device-width,initial-scale=1.0" name=viewport><title>
+         Tailcalls in eBPF
+        
+    </title><meta content="Tailcalls in eBPF" property=og:title><link href=/icon/favicon.png rel=icon type=image/png><link href=https://sidchintamaneni.github.io/fonts.css rel=stylesheet><script async data-goatcounter=https://your_user.example.com/count src=https://sidchintamaneni.github.io/js/count.js></script><noscript><img src="https://your_user.example.com//count?p=/posts/tailcalls/&t=Tailcalls in eBPF"></noscript><link title="Siddharth Chintamaneni" href=https://sidchintamaneni.github.io/atom.xml rel=alternate type=application/atom+xml><link href=https://sidchintamaneni.github.io/theme/dark.css rel=stylesheet><link href=https://sidchintamaneni.github.io/main.css media=screen rel=stylesheet><script src=https://sidchintamaneni.github.io/js/feather.min.js></script><body><div class=content><header><div class=main><a href=https://sidchintamaneni.github.io/>Siddharth Chintamaneni</a><div class=socials><a class=social href=https://linkedin.com/in/sidchintamaneni rel=me> <img alt=linkedin src=/social_icons/linkedin.svg> </a><a class=social href=https://github.com/sidchintamaneni/ rel=me> <img alt=github src=/social_icons/github.svg> </a></div></div><nav><a href=/posts style=margin-left:.7em>/posts</a><a href=/projects style=margin-left:.7em>/projects</a><a href=/about style=margin-left:.7em>/about</a></nav></header><main><article><div class=title><div class=page-header>Tailcalls in eBPF<span class=primary-color style=font-size:1.6em>.</span></div><div class=meta>Posted on <time>2023-09-01</time></div></div><section class=body><h2 id=if-you-are-looking-for>If you are looking for...</h2><ul><li>What are tail calls? <br><li>What are bpf to bpf calls? <br><li>Why each bpf program is restricted to 256 bytes when both bpf to bpf and tail calls are used together and Why the number of tailcall are restricted to 33 and How it is being restricted?<br><li>How to implement tail calls(chaining, using bpf to bpf and chain calls together)? <br><li>How to update the bpf map used by bpf_tail_call in runtime? <br></ul><h2 id=tail-calls-in-bpf>tail calls in BPF</h2><p>In a BPF program, tail calls are used to call an another BPF program without returning to the previous program. Same as tailcall recursion/ optimization/ elimination, BPF tailcall program uses the same stack frame of the caller program. <br><p>If you are not familiar with tailcall optimization, checkout <a href=https://en.wikipedia.org/wiki/Tail_call>wikipedia</a>, <a href=https://eklitzke.org/how-tail-call-optimization-works>eklitzke blog post</a> and <a href="https://www.youtube.com/watch?v=_JtPhF8MshA">computerphile youtube video</a> <br><h2 id=bpf-to-bpf-calls>bpf to bpf calls</h2><p>Previouly there is no function call support for bpf programs. For reusability <code>always_inline</code> functions are used. These inlined functions are duplicated many times in the object file so bpf to bpf calls are introduced. <br><p>Then to answer why exactly each BPF program is restricted to 256 bytes when it used together with tailcalls and bpf to bpf calls and why tailcall are limited to 33, we need to know that each BPF program should be of size 512 bytes and linux kernel stack size for x86 is 16kb. By keeping these two points in our mind let's get into our explanation <br><p>For Suppose we have a BPF program of size: <code>511 bytes</code> <br> now at the end of the program we made bpf to bpf call which consumed stack size: 1 byte <br><p>Inside this bpf to bpf call let's call a tailcall which uses this 1 byte stack frame but consumed stack size: <code>511 bytes</code><br><p>so till now we have consumed 1022 bytes of stack and we have used only 1 tail call. if you continued to do this chaining till 33 tailcall, the total amount of stack we consume is <code>33 * 511 = 16863</code>. which exhaust the kernel stack results in stackoverflow. <br><p>For Suppose if we restrict the stack size of each bpf program to 256 bytes when both bpf to bpf and tailcalls are used together then bpf programs atmost uses <code>255 * 33 = 8415</code> viz, nearly 8kb. <br><p>BPF verifier is restricting the size of subprograms to 256 bytes and JIT is restricting the tailcall count to 33. (In the below implementations I will provide the jitted code for chaining of tailcall programs and show you how exactly limit is enforced on tailcalls during runtime)<h2 id=implementing-a-simple-tailcall-program-and-attaching-it-with-userspace-code-and-bpftool>Implementing a simple tailcall program and attaching it with userspace code and bpftool</h2><p><strong>Kernel Code:</strong><pre class=language-c data-lang=c style=background:#0f1419;color:#bfbab0><code class=language-c data-lang=c><span style=color:#ff7733>#include </span><span style=color:#c2d94c>&LTbpf/bpf_helpers.h>
+</span><span style=color:#ff7733>#include </span><span style=color:#c2d94c>&LTlinux/version.h>
+</span><span style=color:#ff7733>#include </span><span style=color:#c2d94c>&LTuapi/linux/bpf.h>
+</span><span style=color:#ff7733>#include </span><span style=color:#c2d94c>&LTbpf/bpf_tracing.h>
+</span><span>
+</span><span>
+</span><span style=color:#ffb454>SEC</span><span>(</span><span style=color:#c2d94c>"tracepoint/syscalls/sys_enter_execve"</span><span>)
+</span><span style=color:#ff7733>int </span><span style=color:#ffb454>testing_tailcall</span><span>(</span><span style=color:#ff7733>void </span><span style=color:#f29668>*</span><span style=color:#f29718>ctx</span><span>){
+</span><span>	
+</span><span>	</span><span style=color:#ffb454>bpf_printk</span><span>(</span><span style=color:#c2d94c>"testing_tailcall function</span><span style=color:#95e6cb>\n</span><span style=color:#c2d94c>"</span><span>)</span><span style=color:#bfbab0cc>;
+</span><span>	</span><span style=color:#ff7733>return </span><span style=color:#f29718>0</span><span style=color:#bfbab0cc>;
+</span><span>}
+</span><span>
+</span><span style=color:#ff7733>struct </span><span>{
+</span><span>	</span><span style=color:#ffb454>__uint</span><span>(type</span><span style=color:#bfbab0cc>,</span><span> BPF_MAP_TYPE_PROG_ARRAY)</span><span style=color:#bfbab0cc>;
+</span><span>	</span><span style=color:#ffb454>__uint</span><span>(max_entries</span><span style=color:#bfbab0cc>, </span><span style=color:#f29718>2</span><span>)</span><span style=color:#bfbab0cc>;
+</span><span>	</span><span style=color:#ffb454>__uint</span><span>(key_size</span><span style=color:#bfbab0cc>, </span><span style=color:#ff7733>sizeof</span><span>(__u32))</span><span style=color:#bfbab0cc>;
+</span><span>	</span><span style=color:#ffb454>__array</span><span>(values</span><span style=color:#bfbab0cc>, </span><span style=color:#ff7733>int</span><span>(</span><span style=color:#ff7733>void </span><span style=color:#f29668>*</span><span>))</span><span style=color:#bfbab0cc>;
+</span><span>} prog_array </span><span style=color:#ffb454>SEC</span><span>(</span><span style=color:#c2d94c>".maps"</span><span>) </span><span style=color:#f29668>= </span><span>{
+</span><span>	</span><span style=color:#f29668>.</span><span>values </span><span style=color:#f29668>= </span><span>{
+</span><span>		[</span><span style=color:#f29718>1</span><span>] </span><span style=color:#f29668>= </span><span>(</span><span style=color:#ff7733>void </span><span style=color:#f29668>*</span><span>)</span><span style=color:#f29668>&</span><span>testing_tailcall</span><span style=color:#bfbab0cc>,
+</span><span>	}</span><span style=color:#bfbab0cc>,
+</span><span>}</span><span style=color:#bfbab0cc>;
+</span><span>
+</span><span>
+</span><span style=color:#ffb454>SEC</span><span>(</span><span style=color:#c2d94c>"tracepoint/syscalls/sys_enter_execve"</span><span>)
+</span><span style=color:#ff7733>int </span><span style=color:#ffb454>trace_enter_execve</span><span>(</span><span style=color:#ff7733>void </span><span style=color:#f29668>*</span><span style=color:#f29718>ctx</span><span>){
+</span><span>	
+</span><span>	</span><span style=color:#ffb454>bpf_printk</span><span>(</span><span style=color:#c2d94c>"trace_enter_execve function</span><span style=color:#95e6cb>\n</span><span style=color:#c2d94c>"</span><span>)</span><span style=color:#bfbab0cc>;
+</span><span>	</span><span style=color:#ffb454>bpf_tail_call</span><span>(ctx</span><span style=color:#bfbab0cc>, </span><span style=color:#f29668>&</span><span>prog_array</span><span style=color:#bfbab0cc>, </span><span style=color:#f29718>1</span><span>)</span><span style=color:#bfbab0cc>;
+</span><span>
+</span><span>	</span><span style=color:#ff7733>return </span><span style=color:#f29718>0</span><span style=color:#bfbab0cc>;
+</span><span>}
+</span><span>
+</span><span style=color:#ff7733>char</span><span> _license[] </span><span style=color:#ffb454>SEC</span><span>(</span><span style=color:#c2d94c>"license"</span><span>) </span><span style=color:#f29668>= </span><span style=color:#c2d94c>"GPL"</span><span style=color:#bfbab0cc>;
+</span><span>u32 _version </span><span style=color:#ffb454>SEC</span><span>(</span><span style=color:#c2d94c>"version"</span><span>) </span><span style=color:#f29668>=</span><span> LINUX_VERSION_CODE</span><span style=color:#bfbab0cc>;
+</span></code></pre><p><strong>Userspace Code</strong><pre class=language-c data-lang=c style=background:#0f1419;color:#bfbab0><code class=language-c data-lang=c><span style=color:#ff7733>#include </span><span style=color:#c2d94c>&LTerrno.h>
+</span><span style=color:#ff7733>#include </span><span style=color:#c2d94c>&LTstdlib.h>
+</span><span style=color:#ff7733>#include </span><span style=color:#c2d94c>&LTstdio.h>
+</span><span style=color:#ff7733>#include </span><span style=color:#c2d94c>&LTbpf/bpf.h>
+</span><span style=color:#ff7733>#include </span><span style=color:#c2d94c>&LTbpf/libbpf.h>
+</span><span>
+</span><span>
+</span><span style=color:#ff7733>int </span><span style=color:#ffb454>main</span><span>(</span><span style=color:#ff7733>int </span><span style=color:#f29718>argc</span><span style=color:#bfbab0cc>, </span><span style=color:#ff7733>char </span><span style=color:#f29668>**</span><span style=color:#f29718>argv</span><span>){
+</span><span>    
+</span><span>    </span><span style=color:#ff7733>struct</span><span> bpf_link </span><span style=color:#f29668>*</span><span>link </span><span style=color:#f29668>= </span><span style=color:#f29718>NULL</span><span style=color:#bfbab0cc>;
+</span><span>    </span><span style=color:#ff7733>struct</span><span> bpf_program </span><span style=color:#f29668>*</span><span>prog</span><span style=color:#bfbab0cc>;
+</span><span>    </span><span style=color:#ff7733>struct</span><span> bpf_object </span><span style=color:#f29668>*</span><span>obj</span><span style=color:#bfbab0cc>;
+</span><span>
+</span><span>    </span><span style=color:#ff7733>char</span><span> filename[</span><span style=color:#f29718>256</span><span>]</span><span style=color:#bfbab0cc>;
+</span><span>    </span><span style=color:#f07178>snprintf</span><span>(filename</span><span style=color:#bfbab0cc>, </span><span style=color:#ff7733>sizeof</span><span>(filename)</span><span style=color:#bfbab0cc>, </span><span style=color:#c2d94c>"</span><span style=color:#f29718>%s</span><span style=color:#c2d94c>_kern.o"</span><span style=color:#bfbab0cc>,</span><span> argv[</span><span style=color:#f29718>0</span><span>])</span><span style=color:#bfbab0cc>;
+</span><span>
+</span><span>    obj </span><span style=color:#f29668>= </span><span style=color:#ffb454>bpf_object__open_file</span><span>(filename</span><span style=color:#bfbab0cc>, </span><span style=color:#f29718>NULL</span><span>)</span><span style=color:#bfbab0cc>;
+</span><span>    </span><span style=color:#ff7733>if</span><span>(</span><span style=color:#ffb454>libbpf_get_error</span><span>(obj)){
+</span><span>        </span><span style=color:#f07178>fprintf</span><span>(stderr</span><span style=color:#bfbab0cc>, </span><span style=color:#c2d94c>"Error: opening BPF obj file"</span><span>)</span><span style=color:#bfbab0cc>;
+</span><span>        </span><span style=color:#ff7733>return </span><span style=color:#f29718>0</span><span style=color:#bfbab0cc>;
+</span><span>    }
+</span><span>
+</span><span>    prog </span><span style=color:#f29668>= </span><span style=color:#ffb454>bpf_object__find_program_by_name</span><span>(obj</span><span style=color:#bfbab0cc>, </span><span style=color:#c2d94c>"trace_enter_execve"</span><span>)</span><span style=color:#bfbab0cc>;
+</span><span>    </span><span style=color:#ff7733>if</span><span>(</span><span style=color:#f29668>!</span><span>prog){
+</span><span>        </span><span style=color:#f07178>fprintf</span><span>(stderr</span><span style=color:#bfbab0cc>,</span><span style=color:#c2d94c>"finding the prog in the object file failed</span><span style=color:#95e6cb>\n</span><span style=color:#c2d94c>"</span><span>)</span><span style=color:#bfbab0cc>;
+</span><span>        </span><span style=color:#ff7733>goto</span><span> cleanup</span><span style=color:#bfbab0cc>;
+</span><span>    }
+</span><span>
+</span><span>    </span><span style=color:#ff7733>if </span><span>(</span><span style=color:#ffb454>bpf_object__load</span><span>(obj)) {
+</span><span>                </span><span style=color:#f07178>fprintf</span><span>(stderr</span><span style=color:#bfbab0cc>, </span><span style=color:#c2d94c>"ERROR: loading BPF object file failed</span><span style=color:#95e6cb>\n</span><span style=color:#c2d94c>"</span><span>)</span><span style=color:#bfbab0cc>;
+</span><span>                </span><span style=color:#ff7733>goto</span><span> cleanup</span><span style=color:#bfbab0cc>;
+</span><span>    }
+</span><span>
+</span><span>    link </span><span style=color:#f29668>= </span><span style=color:#ffb454>bpf_program__attach</span><span>(prog)</span><span style=color:#bfbab0cc>;
+</span><span>    </span><span style=color:#ff7733>if</span><span>(</span><span style=color:#ffb454>libbpf_get_error</span><span>(link)){
+</span><span>        </span><span style=color:#f07178>fprintf</span><span>(stderr</span><span style=color:#bfbab0cc>, </span><span style=color:#c2d94c>"ERROR: bpf_program__attach failed : </span><span style=color:#f29718>%ld</span><span style=color:#95e6cb>\n</span><span style=color:#c2d94c>"</span><span style=color:#bfbab0cc>, </span><span style=color:#ffb454>libbpf_get_error</span><span>(link))</span><span style=color:#bfbab0cc>;
+</span><span>        link </span><span style=color:#f29668>= </span><span style=color:#f29718>NULL</span><span style=color:#bfbab0cc>;
+</span><span>        </span><span style=color:#ff7733>goto</span><span> cleanup</span><span style=color:#bfbab0cc>;
+</span><span>    }</span><span style=color:#ff7733>else</span><span>{
+</span><span>        </span><span style=color:#f07178>fprintf</span><span>(stderr</span><span style=color:#bfbab0cc>, </span><span style=color:#c2d94c>"Attachment is done</span><span style=color:#95e6cb>\n</span><span style=color:#c2d94c>"</span><span>)</span><span style=color:#bfbab0cc>;
+</span><span>    }
+</span><span>
+</span><span>    </span><span style=color:#ffb454>read_trace_pipe</span><span>()</span><span style=color:#bfbab0cc>;
+</span><span>    </span><span style=color:#59c2ff>cleanup</span><span style=color:#bfbab0cc>:
+</span><span>            </span><span style=color:#ffb454>bpf_link__destroy</span><span>(link)</span><span style=color:#bfbab0cc>;
+</span><span>            </span><span style=color:#ffb454>bpf_object__close</span><span>(obj)</span><span style=color:#bfbab0cc>;
+</span><span>            </span><span style=color:#ff7733>return </span><span style=color:#f29718>0</span><span style=color:#bfbab0cc>;
+</span><span>
+</span><span>}
+</span></code></pre><p><strong>Triggering program</strong><pre style=background:#0f1419;color:#bfbab0><code><span>#include &LTunistd.h>
+</span><span>#include &LTstdio.h>
+</span><span>#include &LTlinux/unistd.h>
+</span><span>
+</span><span>int main(void){
+</span><span>    printf("triggering syscall\n");
+</span><span>    return syscall(60); // sys_exit
+</span><span>}
+</span></code></pre><p><strong>Series of Commands to attach and trigger the programs</strong><pre class=language-bash data-lang=bash style=background:#0f1419;color:#bfbab0><code class=language-bash data-lang=bash><span>
+</span><span style=font-style:italic;color:#5c6773># to generate the bpf executable file checkout Makefile in samples/bpf
+</span><span style=color:#ffb454>sleep</span><span> 5 </span><span style=color:#f29668>&& </span><span style=color:#ffb454>./trigger_program </span><span style=font-style:italic;color:#5c6773>#this will trigger a syscall after 5 seconds
+</span><span style=color:#ffb454>./tailcall_program </span><span style=font-style:italic;color:#5c6773># after compiling run the tailcall_program, ofcourse inside a vm :)
+</span><span>
+</span><span style=font-style:italic;color:#5c6773>#With Bpftool without userspace code
+</span><span style=color:#ffb454>bpftool</span><span> prog loadAll tailcall_kern.o /sys/fs/bpf/test autoattach
+</span><span style=color:#ffb454>./trigger_program </span><span style=font-style:italic;color:#5c6773># check debug messages in /sys/kernel/debug/tracing/trace_pipe
+</span></code></pre><h2 id=implementing-tailcalls-and-bpf2bpf-calls-together>Implementing tailcalls and bpf2bpf calls together</h2><p><strong>Kernel Code</strong><pre class=language-c data-lang=c style=background:#0f1419;color:#bfbab0><code class=language-c data-lang=c><span>include </span><span style=color:#f29668><</span><span>bpf</span><span style=color:#f29668>/</span><span>bpf_helpers</span><span style=color:#f29668>.</span><span>h</span><span style=color:#f29668>>
+</span><span style=color:#ff7733>#include </span><span style=color:#c2d94c>&LTlinux/version.h>
+</span><span style=color:#ff7733>#include </span><span style=color:#c2d94c>&LTuapi/linux/bpf.h>
+</span><span style=color:#ff7733>#include </span><span style=color:#c2d94c>&LTbpf/bpf_tracing.h>
+</span><span>
+</span><span style=color:#ff7733>#define </span><span style=color:#59c2ff>MAX_SSIZE </span><span style=color:#f29718>128 
+</span><span style=color:#ffb454>SEC</span><span>(</span><span style=color:#c2d94c>"tracepoint/syscalls/sys_enter_execve"</span><span>)
+</span><span style=color:#ff7733>int </span><span style=color:#ffb454>testing_tailcall</span><span>(</span><span style=color:#ff7733>void </span><span style=color:#f29668>*</span><span style=color:#f29718>ctx</span><span>){
+</span><span>	
+</span><span>	
+</span><span>	</span><span style=color:#ffb454>bpf_printk</span><span>(</span><span style=color:#c2d94c>"testing_tailcall function</span><span style=color:#95e6cb>\n</span><span style=color:#c2d94c>"</span><span>)</span><span style=color:#bfbab0cc>;
+</span><span>	
+</span><span>	</span><span style=color:#ff7733>return </span><span style=color:#f29718>0</span><span style=color:#bfbab0cc>;
+</span><span>}
+</span><span>
+</span><span style=color:#ff7733>struct </span><span>{
+</span><span>	</span><span style=color:#ffb454>__uint</span><span>(type</span><span style=color:#bfbab0cc>,</span><span> BPF_MAP_TYPE_PROG_ARRAY)</span><span style=color:#bfbab0cc>;
+</span><span>	</span><span style=color:#ffb454>__uint</span><span>(max_entries</span><span style=color:#bfbab0cc>, </span><span style=color:#f29718>2</span><span>)</span><span style=color:#bfbab0cc>;
+</span><span>	</span><span style=color:#ffb454>__uint</span><span>(key_size</span><span style=color:#bfbab0cc>, </span><span style=color:#ff7733>sizeof</span><span>(__u32))</span><span style=color:#bfbab0cc>;
+</span><span>	</span><span style=color:#ffb454>__array</span><span>(values</span><span style=color:#bfbab0cc>, </span><span style=color:#ff7733>int</span><span>(</span><span style=color:#ff7733>void </span><span style=color:#f29668>*</span><span>))</span><span style=color:#bfbab0cc>;
+</span><span>} prog_array </span><span style=color:#ffb454>SEC</span><span>(</span><span style=color:#c2d94c>".maps"</span><span>) </span><span style=color:#f29668>= </span><span>{
+</span><span>	</span><span style=color:#f29668>.</span><span>values </span><span style=color:#f29668>= </span><span>{
+</span><span>		[</span><span style=color:#f29718>1</span><span>] </span><span style=color:#f29668>= </span><span>(</span><span style=color:#ff7733>void </span><span style=color:#f29668>*</span><span>)</span><span style=color:#f29668>&</span><span>testing_tailcall</span><span style=color:#bfbab0cc>,
+</span><span>	}</span><span style=color:#bfbab0cc>,
+</span><span>}</span><span style=color:#bfbab0cc>;
+</span><span>
+</span><span style=color:#ff7733>static __attribute__</span><span>((__noinline__)) </span><span style=color:#ff7733>int </span><span style=color:#ffb454>test_bpf2bpf_call</span><span>(</span><span style=color:#ff7733>void </span><span style=color:#f29668>*</span><span style=color:#f29718>ctx</span><span>){
+</span><span>	
+</span><span>	
+</span><span>	</span><span style=color:#ffb454>bpf_tail_call</span><span>(ctx</span><span style=color:#bfbab0cc>, </span><span style=color:#f29668>&</span><span>prog_array</span><span style=color:#bfbab0cc>, </span><span style=color:#f29718>1</span><span>)</span><span style=color:#bfbab0cc>;
+</span><span>	
+</span><span>
+</span><span>	</span><span style=color:#ff7733>return </span><span style=color:#f29718>0</span><span style=color:#bfbab0cc>;
+</span><span>}
+</span><span>
+</span><span style=color:#ffb454>SEC</span><span>(</span><span style=color:#c2d94c>"tracepoint/syscalls/sys_enter_execve"</span><span>)
+</span><span style=color:#ff7733>int </span><span style=color:#ffb454>trace_enter_execve</span><span>(</span><span style=color:#ff7733>void </span><span style=color:#f29668>*</span><span style=color:#f29718>ctx</span><span>){
+</span><span>	
+</span><span>	</span><span style=color:#ffb454>test_bpf2bpf_call</span><span>(ctx)</span><span style=color:#bfbab0cc>;
+</span><span>
+</span><span>
+</span><span>	</span><span style=color:#ff7733>return </span><span style=color:#f29718>0</span><span style=color:#bfbab0cc>;
+</span><span>}
+</span><span>
+</span><span style=color:#ff7733>char</span><span> _license[] </span><span style=color:#ffb454>SEC</span><span>(</span><span style=color:#c2d94c>"license"</span><span>) </span><span style=color:#f29668>= </span><span style=color:#c2d94c>"GPL"</span><span style=color:#bfbab0cc>;
+</span><span>u32 _version </span><span style=color:#ffb454>SEC</span><span>(</span><span style=color:#c2d94c>"version"</span><span>) </span><span style=color:#f29668>=</span><span> LINUX_VERSION_CODE</span><span style=color:#bfbab0cc>;
+</span></code></pre><p>-- Attaching and triggering mechanism is similar to the above program, so I am not including the Userspace and triggering Code.<h2 id=program-to-maxout-number-of-tailcalls>Program to Maxout Number of tailcalls</h2><p><strong>Kernel Code</strong><pre class=language-c data-lang=c style=background:#0f1419;color:#bfbab0><code class=language-c data-lang=c><span style=color:#ff7733>#include </span><span style=color:#c2d94c>&LTbpf/bpf_helpers.h>
+</span><span style=color:#ff7733>#include </span><span style=color:#c2d94c>&LTlinux/version.h>
+</span><span style=color:#ff7733>#include </span><span style=color:#c2d94c>&LTuapi/linux/bpf.h>
+</span><span style=color:#ff7733>#include </span><span style=color:#c2d94c>&LTbpf/bpf_tracing.h>
+</span><span>
+</span><span>
+</span><span style=color:#ffb454>SEC</span><span>(</span><span style=color:#c2d94c>"fentry/__x64_sys_execve"</span><span>)
+</span><span style=color:#ff7733>int </span><span style=color:#ffb454>testing_func5</span><span>(</span><span style=color:#ff7733>void </span><span style=color:#f29668>*</span><span style=color:#f29718>ctx</span><span>){
+</span><span>    </span><span style=color:#ffb454>bpf_printk</span><span>(</span><span style=color:#c2d94c>"inside tail-call 5"</span><span>)</span><span style=color:#bfbab0cc>;
+</span><span>    </span><span style=color:#ff7733>return </span><span style=color:#f29718>0</span><span style=color:#bfbab0cc>;
+</span><span>}
+</span><span>
+</span><span style=color:#ff7733>struct </span><span>{
+</span><span>	</span><span style=color:#ffb454>__uint</span><span>(type</span><span style=color:#bfbab0cc>,</span><span> BPF_MAP_TYPE_PROG_ARRAY)</span><span style=color:#bfbab0cc>;
+</span><span>	</span><span style=color:#ffb454>__uint</span><span>(max_entries</span><span style=color:#bfbab0cc>, </span><span style=color:#f29718>10</span><span>)</span><span style=color:#bfbab0cc>;
+</span><span>	</span><span style=color:#ffb454>__uint</span><span>(key_size</span><span style=color:#bfbab0cc>, </span><span style=color:#ff7733>sizeof</span><span>(__u32))</span><span style=color:#bfbab0cc>;
+</span><span>	</span><span style=color:#ffb454>__array</span><span>(values</span><span style=color:#bfbab0cc>, </span><span style=color:#ff7733>int </span><span>(</span><span style=color:#ff7733>void </span><span style=color:#f29668>*</span><span>))</span><span style=color:#bfbab0cc>;
+</span><span>} prog_array_init5 </span><span style=color:#ffb454>SEC</span><span>(</span><span style=color:#c2d94c>".maps"</span><span>) </span><span style=color:#f29668>= </span><span>{
+</span><span>	</span><span style=color:#f29668>.</span><span>values </span><span style=color:#f29668>= </span><span>{
+</span><span>		[</span><span style=color:#f29718>1</span><span>] </span><span style=color:#f29668>= </span><span>(</span><span style=color:#ff7733>void </span><span style=color:#f29668>*</span><span>)</span><span style=color:#f29668>&</span><span>testing_func5</span><span style=color:#bfbab0cc>,
+</span><span>	}</span><span style=color:#bfbab0cc>,
+</span><span>}</span><span style=color:#bfbab0cc>;
+</span><span style=color:#ffb454>SEC</span><span>(</span><span style=color:#c2d94c>"fentry/__x64_sys_execve"</span><span>)
+</span><span style=color:#ff7733>int </span><span style=color:#ffb454>testing_func4</span><span>(</span><span style=color:#ff7733>void </span><span style=color:#f29668>*</span><span style=color:#f29718>ctx</span><span>){
+</span><span>    </span><span style=color:#ffb454>bpf_printk</span><span>(</span><span style=color:#c2d94c>"inside tail-call 4"</span><span>)</span><span style=color:#bfbab0cc>;
+</span><span>    </span><span style=color:#ffb454>bpf_tail_call</span><span>(ctx</span><span style=color:#bfbab0cc>, </span><span style=color:#f29668>&</span><span>prog_array_init5</span><span style=color:#bfbab0cc>, </span><span style=color:#f29718>1</span><span>)</span><span style=color:#bfbab0cc>;
+</span><span>    </span><span style=color:#ff7733>return </span><span style=color:#f29718>0</span><span style=color:#bfbab0cc>;
+</span><span>}
+</span><span>
+</span><span style=color:#ff7733>struct </span><span>{
+</span><span>	</span><span style=color:#ffb454>__uint</span><span>(type</span><span style=color:#bfbab0cc>,</span><span> BPF_MAP_TYPE_PROG_ARRAY)</span><span style=color:#bfbab0cc>;
+</span><span>	</span><span style=color:#ffb454>__uint</span><span>(max_entries</span><span style=color:#bfbab0cc>, </span><span style=color:#f29718>10</span><span>)</span><span style=color:#bfbab0cc>;
+</span><span>	</span><span style=color:#ffb454>__uint</span><span>(key_size</span><span style=color:#bfbab0cc>, </span><span style=color:#ff7733>sizeof</span><span>(__u32))</span><span style=color:#bfbab0cc>;
+</span><span>	</span><span style=color:#ffb454>__array</span><span>(values</span><span style=color:#bfbab0cc>, </span><span style=color:#ff7733>int </span><span>(</span><span style=color:#ff7733>void </span><span style=color:#f29668>*</span><span>))</span><span style=color:#bfbab0cc>;
+</span><span>} prog_array_init4 </span><span style=color:#ffb454>SEC</span><span>(</span><span style=color:#c2d94c>".maps"</span><span>) </span><span style=color:#f29668>= </span><span>{
+</span><span>	</span><span style=color:#f29668>.</span><span>values </span><span style=color:#f29668>= </span><span>{
+</span><span>		[</span><span style=color:#f29718>1</span><span>] </span><span style=color:#f29668>= </span><span>(</span><span style=color:#ff7733>void </span><span style=color:#f29668>*</span><span>)</span><span style=color:#f29668>&</span><span>testing_func4</span><span style=color:#bfbab0cc>,
+</span><span>	}</span><span style=color:#bfbab0cc>,
+</span><span>}</span><span style=color:#bfbab0cc>;
+</span><span>
+</span><span style=color:#ff7733>#define </span><span style=color:#ffb454>RTAIL_CALL</span><span>(</span><span style=color:#f29718>X</span><span style=color:#bfbab0cc>, </span><span style=color:#f29718>Y</span><span>) </span><span style=color:#bfbab0cc>\
+</span><span style=color:#ffb454>SEC</span><span>(</span><span style=color:#c2d94c>"fentry/__x64_sys_execve"</span><span>) </span><span style=color:#bfbab0cc>\
+</span><span style=color:#ff7733>int</span><span> testing_func ## </span><span style=color:#ffb454>X</span><span>(</span><span style=color:#ff7733>void </span><span style=color:#f29668>*</span><span>ctx){ </span><span style=color:#bfbab0cc>\
+</span><span>    </span><span style=color:#ffb454>bpf_printk</span><span>(</span><span style=color:#c2d94c>"inside tail-call </span><span style=color:#f29718>%s</span><span style=color:#c2d94c>"</span><span style=color:#bfbab0cc>,</span><span>#X)</span><span style=color:#bfbab0cc>; \
+</span><span>    </span><span style=color:#ffb454>bpf_tail_call</span><span>(ctx</span><span style=color:#bfbab0cc>, </span><span style=color:#f29668>&</span><span>prog_array_init##Y</span><span style=color:#bfbab0cc>, </span><span style=color:#f29718>1</span><span>)</span><span style=color:#bfbab0cc>; \
+</span><span>    </span><span style=color:#ff7733>return </span><span style=color:#f29718>0</span><span style=color:#bfbab0cc>; \
+</span><span>} </span><span style=color:#bfbab0cc>\
+</span><span style=color:#ff7733>struct </span><span>{ </span><span style=color:#bfbab0cc>\
+</span><span>	</span><span style=color:#ffb454>__uint</span><span>(type</span><span style=color:#bfbab0cc>,</span><span> BPF_MAP_TYPE_PROG_ARRAY)</span><span style=color:#bfbab0cc>; \
+</span><span>	</span><span style=color:#ffb454>__uint</span><span>(max_entries</span><span style=color:#bfbab0cc>, </span><span style=color:#f29718>2</span><span>)</span><span style=color:#bfbab0cc>; \
+</span><span>	</span><span style=color:#ffb454>__uint</span><span>(key_size</span><span style=color:#bfbab0cc>, </span><span style=color:#ff7733>sizeof</span><span>(__u32))</span><span style=color:#bfbab0cc>; \
+</span><span>	</span><span style=color:#ffb454>__array</span><span>(values</span><span style=color:#bfbab0cc>, </span><span style=color:#ff7733>int </span><span>(</span><span style=color:#ff7733>void </span><span style=color:#f29668>*</span><span>))</span><span style=color:#bfbab0cc>; \
+</span><span>} prog_array_init##X </span><span style=color:#ffb454>SEC</span><span>(</span><span style=color:#c2d94c>".maps"</span><span>) </span><span style=color:#f29668>= </span><span>{ </span><span style=color:#bfbab0cc>\
+</span><span>	</span><span style=color:#f29668>.</span><span>values </span><span style=color:#f29668>= </span><span>{ </span><span style=color:#bfbab0cc>\
+</span><span>		[</span><span style=color:#f29718>1</span><span>] </span><span style=color:#f29668>= </span><span>(</span><span style=color:#ff7733>void </span><span style=color:#f29668>*</span><span>)</span><span style=color:#f29668>&</span><span>testing_func##X</span><span style=color:#bfbab0cc>, \
+</span><span>	}</span><span style=color:#bfbab0cc>, \
+</span><span>} </span><span style=color:#bfbab0cc>\
+</span><span>
+</span><span style=color:#ffb454>RTAIL_CALL</span><span>(</span><span style=color:#f29718>3</span><span style=color:#bfbab0cc>, </span><span style=color:#f29718>4</span><span>)</span><span style=color:#bfbab0cc>;
+</span><span style=color:#ffb454>RTAIL_CALL</span><span>(</span><span style=color:#f29718>2</span><span style=color:#bfbab0cc>, </span><span style=color:#f29718>3</span><span>)</span><span style=color:#bfbab0cc>;
+</span><span>
+</span><span>
+</span><span style=color:#ffb454>SEC</span><span>(</span><span style=color:#c2d94c>"fentry/__x64_sys_execve"</span><span>)
+</span><span style=color:#ff7733>int </span><span style=color:#ffb454>testing_func</span><span>(</span><span style=color:#ff7733>void </span><span style=color:#f29668>*</span><span style=color:#f29718>ctx</span><span>){
+</span><span>    </span><span style=color:#ffb454>bpf_printk</span><span>(</span><span style=color:#c2d94c>"inside tail-call 1"</span><span>)</span><span style=color:#bfbab0cc>;
+</span><span>
+</span><span>    </span><span style=color:#ffb454>bpf_tail_call</span><span>(ctx</span><span style=color:#bfbab0cc>, </span><span style=color:#f29668>&</span><span>prog_array_init2</span><span style=color:#bfbab0cc>, </span><span style=color:#f29718>1</span><span>)</span><span style=color:#bfbab0cc>;
+</span><span>    </span><span style=color:#ff7733>return </span><span style=color:#f29718>0</span><span style=color:#bfbab0cc>;
+</span><span>}
+</span><span>
+</span><span>
+</span><span style=color:#ff7733>struct </span><span>{
+</span><span>	</span><span style=color:#ffb454>__uint</span><span>(type</span><span style=color:#bfbab0cc>,</span><span> BPF_MAP_TYPE_PROG_ARRAY)</span><span style=color:#bfbab0cc>;
+</span><span>	</span><span style=color:#ffb454>__uint</span><span>(max_entries</span><span style=color:#bfbab0cc>, </span><span style=color:#f29718>10</span><span>)</span><span style=color:#bfbab0cc>;
+</span><span>	</span><span style=color:#ffb454>__uint</span><span>(key_size</span><span style=color:#bfbab0cc>, </span><span style=color:#ff7733>sizeof</span><span>(__u32))</span><span style=color:#bfbab0cc>;
+</span><span>	</span><span style=color:#ffb454>__array</span><span>(values</span><span style=color:#bfbab0cc>, </span><span style=color:#ff7733>int </span><span>(</span><span style=color:#ff7733>void </span><span style=color:#f29668>*</span><span>))</span><span style=color:#bfbab0cc>;
+</span><span>} prog_array_init </span><span style=color:#ffb454>SEC</span><span>(</span><span style=color:#c2d94c>".maps"</span><span>) </span><span style=color:#f29668>= </span><span>{
+</span><span>	</span><span style=color:#f29668>.</span><span>values </span><span style=color:#f29668>= </span><span>{
+</span><span>		[</span><span style=color:#f29718>1</span><span>] </span><span style=color:#f29668>= </span><span>(</span><span style=color:#ff7733>void </span><span style=color:#f29668>*</span><span>)</span><span style=color:#f29668>&</span><span>testing_func</span><span style=color:#bfbab0cc>,
+</span><span>	}</span><span style=color:#bfbab0cc>,
+</span><span>}</span><span style=color:#bfbab0cc>;
+</span><span>
+</span><span>
+</span><span>
+</span><span>
+</span><span style=color:#ffb454>SEC</span><span>(</span><span style=color:#c2d94c>"fentry/__x64_sys_execve"</span><span>)
+</span><span style=color:#ff7733>int </span><span style=color:#ffb454>trace_enter_execve</span><span>(</span><span style=color:#ff7733>struct</span><span> pt_regs </span><span style=color:#f29668>*</span><span style=color:#f29718>ctx</span><span>)
+</span><span>{	
+</span><span>    </span><span style=color:#ffb454>bpf_printk</span><span>(</span><span style=color:#c2d94c>"Inside Kernel Main Function"</span><span>)</span><span style=color:#bfbab0cc>;
+</span><span>
+</span><span>    </span><span style=color:#ffb454>bpf_tail_call</span><span>(ctx</span><span style=color:#bfbab0cc>, </span><span style=color:#f29668>&</span><span>prog_array_init</span><span style=color:#bfbab0cc>, </span><span style=color:#f29718>1</span><span>)</span><span style=color:#bfbab0cc>;
+</span><span>
+</span><span>    </span><span style=color:#ff7733>return </span><span style=color:#f29718>0</span><span style=color:#bfbab0cc>;	
+</span><span>}
+</span><span>
+</span><span style=color:#ff7733>char</span><span> _license[] </span><span style=color:#ffb454>SEC</span><span>(</span><span style=color:#c2d94c>"license"</span><span>) </span><span style=color:#f29668>= </span><span style=color:#c2d94c>"GPL"</span><span style=color:#bfbab0cc>;
+</span><span>u32 _version </span><span style=color:#ffb454>SEC</span><span>(</span><span style=color:#c2d94c>"version"</span><span>) </span><span style=color:#f29668>=</span><span> LINUX_VERSION_CODE</span><span style=color:#bfbab0cc>;
+</span></code></pre><pre class=language-asm data-lang=asm style=background:#0f1419;color:#bfbab0><code class=language-asm data-lang=asm><span style=color:#f29718>0xffffffffa00020a8</span><span style=color:#ffb454>:	endbr64
+</span><span style=color:#ffb454>   </span><span style=color:#f29718>0xffffffffa00020ac</span><span style=color:#ffb454>:	nopl   </span><span style=color:#f29718>0x0</span><span style=color:#ffb454>(%</span><span style=color:#f29718>rax</span><span>,</span><span style=color:#ffb454>%</span><span style=color:#f29718>rax</span><span>,</span><span style=color:#f29718>1</span><span style=color:#ffb454>)
+</span><span style=color:#ffb454>   </span><span style=color:#f29718>0xffffffffa00020b1</span><span style=color:#ffb454>:	</span><span style=color:#ff7733>xor    </span><span style=color:#ffb454>%</span><span style=color:#f29718>eax</span><span>,</span><span style=color:#ffb454>%</span><span style=color:#f29718>eax
+</span><span style=color:#ffb454>   </span><span style=color:#f29718>0xffffffffa00020b3</span><span style=color:#ffb454>:	</span><span style=color:#ff7733>push   </span><span style=color:#ffb454>%</span><span style=color:#f29718>rbp
+</span><span style=color:#ffb454>   </span><span style=color:#f29718>0xffffffffa00020b4</span><span style=color:#ffb454>:	</span><span style=color:#ff7733>mov    </span><span style=color:#ffb454>%</span><span style=color:#f29718>rsp</span><span>,</span><span style=color:#ffb454>%</span><span style=color:#f29718>rbp
+</span><span style=color:#ffb454>   </span><span style=color:#f29718>0xffffffffa00020b7</span><span style=color:#ffb454>:	endbr64
+</span><span style=color:#ffb454>   </span><span style=color:#f29718>0xffffffffa00020bb</span><span style=color:#ffb454>:	</span><span style=color:#ff7733>push   </span><span style=color:#ffb454>%</span><span style=color:#f29718>rax
+</span><span style=color:#ffb454>   </span><span style=color:#f29718>0xffffffffa00020ed</span><span style=color:#ffb454>:	</span><span style=color:#ff7733>mov    </span><span>-</span><span style=color:#f29718>0x4</span><span style=color:#ffb454>(%</span><span style=color:#f29718>rbp</span><span style=color:#ffb454>)</span><span>,</span><span style=color:#ffb454>%</span><span style=color:#f29718>eax
+</span><span style=color:#ffb454>   </span><span style=color:#f29718>0xffffffffa00020f3</span><span style=color:#ffb454>:	</span><span style=color:#ff7733>cmp    </span><span style=color:#f07178>$</span><span style=color:#f29718>0x21</span><span>,</span><span style=color:#ffb454>%</span><span style=color:#f29718>eax
+</span><span style=color:#ffb454>   </span><span style=color:#f29718>0xffffffffa00020f6</span><span style=color:#ffb454>:	</span><span style=color:#ff7733>jae    </span><span style=color:#f29718>0xffffffffa000210d
+</span><span style=color:#ffb454>   </span><span style=color:#f29718>0xffffffffa00020f8</span><span style=color:#ffb454>:	</span><span style=color:#ff7733>add    </span><span style=color:#f07178>$</span><span style=color:#f29718>0x1</span><span>,</span><span style=color:#ffb454>%</span><span style=color:#f29718>eax
+</span><span style=color:#ffb454>   </span><span style=color:#f29718>0xffffffffa00020fb</span><span style=color:#ffb454>:	</span><span style=color:#ff7733>mov    </span><span style=color:#ffb454>%</span><span style=color:#f29718>eax</span><span>,-</span><span style=color:#f29718>0x4</span><span style=color:#ffb454>(%</span><span style=color:#f29718>rbp</span><span style=color:#ffb454>)
+</span><span style=color:#ffb454>   </span><span style=color:#f29718>0xffffffffa0002101</span><span style=color:#ffb454>:	nopl   </span><span style=color:#f29718>0x0</span><span style=color:#ffb454>(%</span><span style=color:#f29718>rax</span><span>,</span><span style=color:#ffb454>%</span><span style=color:#f29718>rax</span><span>,</span><span style=color:#f29718>1</span><span style=color:#ffb454>)
+</span><span style=color:#ffb454>   </span><span style=color:#f29718>0xffffffffa0002106</span><span style=color:#ffb454>:	</span><span style=color:#ff7733>pop    </span><span style=color:#ffb454>%</span><span style=color:#f29718>rbx
+</span><span style=color:#ffb454>   </span><span style=color:#f29718>0xffffffffa0002107</span><span style=color:#ffb454>:	</span><span style=color:#ff7733>pop    </span><span style=color:#ffb454>%</span><span style=color:#f29718>rax
+</span><span style=color:#ffb454>   </span><span style=color:#f29718>0xffffffffa0002108</span><span style=color:#ffb454>:	</span><span style=color:#ff7733>jmp    </span><span style=color:#f29718>0xffffffffa0002007
+</span><span style=color:#ffb454>   </span><span style=color:#f29718>0xffffffffa000210d</span><span style=color:#ffb454>:	</span><span style=color:#ff7733>xor    </span><span style=color:#ffb454>%</span><span style=color:#f29718>eax</span><span>,</span><span style=color:#ffb454>%</span><span style=color:#f29718>eax
+</span><span style=color:#ffb454>   </span><span style=color:#f29718>0xffffffffa000210f</span><span style=color:#ffb454>:	</span><span style=color:#ff7733>pop    </span><span style=color:#ffb454>%</span><span style=color:#f29718>rbx
+</span></code></pre><p>-- The above is the abridged snapshot of jitted code of the starting program that is calling a tailcall, in ins 9 we can see that eax is set to 0. and in ins 13 and 14 both rax and rbp values are pushed. In ins 45, earlier pushed rax value is accessed and moved to eax. then it is compared if it's count is equal to 33 if it 33 then it jump to ins 65 otherwise eax is incremented by 1 and moved to earlier position<pre class=language-asm data-lang=asm style=background:#0f1419;color:#bfbab0><code class=language-asm data-lang=asm><span style=color:#ffb454>   </span><span style=color:#f29718>0xffffffffa0002007</span><span style=color:#ffb454>:	endbr64
+</span><span style=color:#ffb454>   </span><span style=color:#f29718>0xffffffffa000200b</span><span style=color:#ffb454>:	</span><span style=color:#ff7733>push   </span><span style=color:#ffb454>%</span><span style=color:#f29718>rax
+</span><span style=color:#ffb454>   </span><span style=color:#f29718>0xffffffffa000200c</span><span style=color:#ffb454>:	</span><span style=color:#ff7733>push   </span><span style=color:#ffb454>%</span><span style=color:#f29718>rbx
+</span><span style=color:#ffb454>   </span><span style=color:#f29718>0xffffffffa000200d</span><span style=color:#ffb454>:	</span><span style=color:#ff7733>mov    </span><span style=color:#ffb454>%</span><span style=color:#f29718>rdi</span><span>,</span><span style=color:#ffb454>%</span><span style=color:#f29718>rbx
+</span><span style=color:#ffb454>   </span><span style=color:#f29718>0xffffffffa0002010</span><span style=color:#ffb454>:	movabs </span><span style=color:#f07178>$</span><span style=color:#f29718>0xffff88800712a530</span><span>,</span><span style=color:#ffb454>%</span><span style=color:#f29718>rdi
+</span><span style=color:#ffb454>   </span><span style=color:#f29718>0xffffffffa000201a</span><span style=color:#ffb454>:	</span><span style=color:#ff7733>mov    </span><span style=color:#f07178>$</span><span style=color:#f29718>0x13</span><span>,</span><span style=color:#ffb454>%</span><span style=color:#f29718>esi
+</span><span style=color:#ffb454>   </span><span style=color:#f29718>0xffffffffa000201f</span><span style=color:#ffb454>:	</span><span style=color:#ff7733>mov    </span><span>-</span><span style=color:#f29718>0x8</span><span style=color:#ffb454>(%</span><span style=color:#f29718>rbp</span><span style=color:#ffb454>)</span><span>,</span><span style=color:#ffb454>%</span><span style=color:#f29718>rax
+</span><span style=color:#ffb454>   </span><span style=color:#f29718>0xffffffffa0002026</span><span style=color:#ffb454>:	</span><span style=color:#ff7733>call   </span><span style=color:#f29718>0xffffffff811cd720
+</span><span style=color:#ffb454>   </span><span style=color:#f29718>0xffffffffa000202b</span><span style=color:#ffb454>:	</span><span style=color:#ff7733>mov    </span><span style=color:#ffb454>%</span><span style=color:#f29718>rbx</span><span>,</span><span style=color:#ffb454>%</span><span style=color:#f29718>rdi
+</span><span style=color:#ffb454>   </span><span style=color:#f29718>0xffffffffa000202e</span><span style=color:#ffb454>:	movabs </span><span style=color:#f07178>$</span><span style=color:#f29718>0xffff888006af0000</span><span>,</span><span style=color:#ffb454>%</span><span style=color:#f29718>rsi
+</span><span style=color:#ffb454>   </span><span style=color:#f29718>0xffffffffa0002038</span><span style=color:#ffb454>:	</span><span style=color:#ff7733>mov    </span><span style=color:#f07178>$</span><span style=color:#f29718>0x1</span><span>,</span><span style=color:#ffb454>%</span><span style=color:#f29718>edx
+</span><span style=color:#ffb454>   </span><span style=color:#f29718>0xffffffffa000203d</span><span style=color:#ffb454>:	</span><span style=color:#ff7733>mov    </span><span>-</span><span style=color:#f29718>0x4</span><span style=color:#ffb454>(%</span><span style=color:#f29718>rbp</span><span style=color:#ffb454>)</span><span>,</span><span style=color:#ffb454>%</span><span style=color:#f29718>eax
+</span><span style=color:#ffb454>   </span><span style=color:#f29718>0xffffffffa0002043</span><span style=color:#ffb454>:	</span><span style=color:#ff7733>cmp    </span><span style=color:#f07178>$</span><span style=color:#f29718>0x21</span><span>,</span><span style=color:#ffb454>%</span><span style=color:#f29718>eax
+</span><span style=color:#ffb454>   </span><span style=color:#f29718>0xffffffffa0002046</span><span style=color:#ffb454>:	</span><span style=color:#ff7733>jae    </span><span style=color:#f29718>0xffffffffa000205d
+</span><span style=color:#ffb454>   </span><span style=color:#f29718>0xffffffffa0002048</span><span style=color:#ffb454>:	</span><span style=color:#ff7733>add    </span><span style=color:#f07178>$</span><span style=color:#f29718>0x1</span><span>,</span><span style=color:#ffb454>%</span><span style=color:#f29718>eax
+</span><span style=color:#ffb454>   </span><span style=color:#f29718>0xffffffffa000204b</span><span style=color:#ffb454>:	</span><span style=color:#ff7733>mov    </span><span style=color:#ffb454>%</span><span style=color:#f29718>eax</span><span>,-</span><span style=color:#f29718>0x4</span><span style=color:#ffb454>(%</span><span style=color:#f29718>rbp</span><span style=color:#ffb454>)
+</span><span style=color:#ffb454>   </span><span style=color:#f29718>0xffffffffa0002051</span><span style=color:#ffb454>:	nopl   </span><span style=color:#f29718>0x0</span><span style=color:#ffb454>(%</span><span style=color:#f29718>rax</span><span>,</span><span style=color:#ffb454>%</span><span style=color:#f29718>rax</span><span>,</span><span style=color:#f29718>1</span><span style=color:#ffb454>)
+</span><span style=color:#ffb454>   </span><span style=color:#f29718>0xffffffffa0002056</span><span style=color:#ffb454>:	</span><span style=color:#ff7733>pop    </span><span style=color:#ffb454>%</span><span style=color:#f29718>rbx
+</span><span style=color:#ffb454>  </span><span style=color:#f29718>0xffffffffa0002057</span><span style=color:#ffb454>:	</span><span style=color:#ff7733>pop    </span><span style=color:#ffb454>%</span><span style=color:#f29718>rax
+</span><span style=color:#ffb454>   </span><span style=color:#f29718>0xffffffffa0002058</span><span style=color:#ffb454>:	</span><span style=color:#ff7733>jmp    </span><span style=color:#f29718>0xffffffffa0001f27
+</span><span style=color:#ffb454>   </span><span style=color:#f29718>0xffffffffa000205d</span><span style=color:#ffb454>:	</span><span style=color:#ff7733>xor    </span><span style=color:#ffb454>%</span><span style=color:#f29718>eax</span><span>,</span><span style=color:#ffb454>%</span><span style=color:#f29718>eax
+</span><span style=color:#ffb454>   </span><span style=color:#f29718>0xffffffffa000205f</span><span style=color:#ffb454>:	</span><span style=color:#ff7733>pop    </span><span style=color:#ffb454>%</span><span style=color:#f29718>rbx
+</span></code></pre><p>-- this is the jitted code after the jump to the tailcall.<pre class=language-bash data-lang=bash style=background:#0f1419;color:#bfbab0><code class=language-bash data-lang=bash><span style=font-style:italic;color:#5c6773># For real jump target above we are using gdb
+</span><span style=color:#ffb454>tail</span><span>  /proc/kallsyms
+</span><span style=color:#ffb454>gdb</span><span style=color:#f29718> -q -c</span><span> /proc/kcore</span><span style=color:#f29718> -ex </span><span style=color:#c2d94c>'x/30i ffffffffa00020a8'</span><span style=color:#f29718> -ex </span><span style=color:#c2d94c>'quit'
+</span><span style=color:#ffb454>gdb</span><span style=color:#f29718> -q -c</span><span> /proc/kcore</span><span style=color:#f29718> -ex </span><span style=color:#c2d94c>'x/30i 0xffffffffa0002007'</span><span style=color:#f29718> -ex </span><span style=color:#c2d94c>'quit'
+</span></code></pre><h2 id=program-to-update-tailcall-map-from-userspace-by-pinning-for-simple-update-of-map-you-can-check-out-selftest-folder-in-the-kernel>Program to update Tailcall Map from Userspace by pinning(for simple update of map you can check out selftest folder in the kernel)</h2><p><strong>Kernel Code</strong><pre class=language-C data-lang=C style=background:#0f1419;color:#bfbab0><code class=language-C data-lang=C><span style=color:#ff7733>#include </span><span style=color:#c2d94c>&LTbpf/bpf_helpers.h>
+</span><span style=color:#ff7733>#include </span><span style=color:#c2d94c>&LTlinux/version.h>
+</span><span style=color:#ff7733>#include </span><span style=color:#c2d94c>&LTuapi/linux/bpf.h>
+</span><span style=color:#ff7733>#include </span><span style=color:#c2d94c>&LTbpf/bpf_tracing.h>
+</span><span>
+</span><span>
+</span><span>
+</span><span style=color:#ffb454>SEC</span><span>(</span><span style=color:#c2d94c>"fentry/__x64_sys_execve"</span><span>)
+</span><span style=color:#ff7733>int </span><span style=color:#ffb454>testing_func_user</span><span>(</span><span style=color:#ff7733>void </span><span style=color:#f29668>*</span><span style=color:#f29718>ctx</span><span>){
+</span><span>    </span><span style=color:#ffb454>bpf_printk</span><span>(</span><span style=color:#c2d94c>"inside testing_func_user"</span><span>)</span><span style=color:#bfbab0cc>;
+</span><span>
+</span><span>    </span><span style=color:#ff7733>return </span><span style=color:#f29718>0</span><span style=color:#bfbab0cc>;
+</span><span>}
+</span><span>
+</span><span style=color:#ffb454>SEC</span><span>(</span><span style=color:#c2d94c>"fentry/__x64_sys_execve"</span><span>)
+</span><span style=color:#ff7733>int </span><span style=color:#ffb454>testing_func</span><span>(</span><span style=color:#ff7733>void </span><span style=color:#f29668>*</span><span style=color:#f29718>ctx</span><span>){
+</span><span>    </span><span style=color:#ffb454>bpf_printk</span><span>(</span><span style=color:#c2d94c>"inside testing_func"</span><span>)</span><span style=color:#bfbab0cc>;
+</span><span>
+</span><span>    </span><span style=color:#ff7733>return </span><span style=color:#f29718>0</span><span style=color:#bfbab0cc>;
+</span><span>}
+</span><span>
+</span><span style=color:#ff7733>struct </span><span>{
+</span><span>	</span><span style=color:#ffb454>__uint</span><span>(type</span><span style=color:#bfbab0cc>,</span><span> BPF_MAP_TYPE_PROG_ARRAY)</span><span style=color:#bfbab0cc>;
+</span><span>	</span><span style=color:#ffb454>__uint</span><span>(pinning</span><span style=color:#bfbab0cc>,</span><span> LIBBPF_PIN_BY_NAME)</span><span style=color:#bfbab0cc>;
+</span><span>	</span><span style=color:#ffb454>__uint</span><span>(max_entries</span><span style=color:#bfbab0cc>, </span><span style=color:#f29718>10</span><span>)</span><span style=color:#bfbab0cc>;
+</span><span>	</span><span style=color:#ffb454>__uint</span><span>(key_size</span><span style=color:#bfbab0cc>, </span><span style=color:#ff7733>sizeof</span><span>(__u32))</span><span style=color:#bfbab0cc>;
+</span><span>	</span><span style=color:#ffb454>__array</span><span>(values</span><span style=color:#bfbab0cc>, </span><span style=color:#ff7733>int </span><span>(</span><span style=color:#ff7733>void </span><span style=color:#f29668>*</span><span>))</span><span style=color:#bfbab0cc>;
+</span><span>} prog_array_init </span><span style=color:#ffb454>SEC</span><span>(</span><span style=color:#c2d94c>".maps"</span><span>) </span><span style=color:#f29668>= </span><span>{
+</span><span>	</span><span style=color:#f29668>.</span><span>values </span><span style=color:#f29668>= </span><span>{
+</span><span>		[</span><span style=color:#f29718>1</span><span>] </span><span style=color:#f29668>= </span><span>(</span><span style=color:#ff7733>void </span><span style=color:#f29668>*</span><span>)</span><span style=color:#f29668>&</span><span>testing_func</span><span style=color:#bfbab0cc>,
+</span><span>	}</span><span style=color:#bfbab0cc>,
+</span><span>}</span><span style=color:#bfbab0cc>;
+</span><span>
+</span><span style=color:#ffb454>SEC</span><span>(</span><span style=color:#c2d94c>"fentry/__x64_sys_execve"</span><span>)
+</span><span style=color:#ff7733>int </span><span style=color:#ffb454>trace_enter_execve</span><span>(</span><span style=color:#ff7733>struct</span><span> pt_regs </span><span style=color:#f29668>*</span><span style=color:#f29718>ctx</span><span>)
+</span><span>{
+</span><span>    </span><span style=color:#ffb454>bpf_printk</span><span>(</span><span style=color:#c2d94c>"Inside Kernel Main Function"</span><span>)</span><span style=color:#bfbab0cc>;
+</span><span>
+</span><span>    </span><span style=color:#ffb454>bpf_tail_call</span><span>(ctx</span><span style=color:#bfbab0cc>, </span><span style=color:#f29668>&</span><span>prog_array_init</span><span style=color:#bfbab0cc>, </span><span style=color:#f29718>1</span><span>)</span><span style=color:#bfbab0cc>;
+</span><span>
+</span><span>    </span><span style=color:#ff7733>return </span><span style=color:#f29718>0</span><span style=color:#bfbab0cc>;
+</span><span>}
+</span><span>
+</span><span style=color:#ff7733>char</span><span> _license[] </span><span style=color:#ffb454>SEC</span><span>(</span><span style=color:#c2d94c>"license"</span><span>) </span><span style=color:#f29668>= </span><span style=color:#c2d94c>"GPL"</span><span style=color:#bfbab0cc>;
+</span><span>u32 _version </span><span style=color:#ffb454>SEC</span><span>(</span><span style=color:#c2d94c>"version"</span><span>) </span><span style=color:#f29668>=</span><span> LINUX_VERSION_CODE</span><span style=color:#bfbab0cc>;
+</span></code></pre><p><strong>Userspace Code for attaching</strong><pre class=language-C data-lang=C style=background:#0f1419;color:#bfbab0><code class=language-C data-lang=C><span style=color:#ff7733>#include </span><span style=color:#c2d94c>&LTerrno.h>
+</span><span style=color:#ff7733>#include </span><span style=color:#c2d94c>&LTstdlib.h>
+</span><span style=color:#ff7733>#include </span><span style=color:#c2d94c>&LTstdio.h>
+</span><span style=color:#ff7733>#include </span><span style=color:#c2d94c>&LTbpf/bpf.h>
+</span><span style=color:#ff7733>#include </span><span style=color:#c2d94c>&LTbpf/libbpf.h>
+</span><span>
+</span><span style=color:#ff7733>#define </span><span style=color:#59c2ff>BPF_SYSFS_ROOT </span><span style=color:#c2d94c>"/sys/fs/bpf"
+</span><span>
+</span><span>
+</span><span style=color:#ff7733>int </span><span style=color:#ffb454>main</span><span>(</span><span style=color:#ff7733>int </span><span style=color:#f29718>argc</span><span style=color:#bfbab0cc>, </span><span style=color:#ff7733>char </span><span style=color:#f29668>**</span><span style=color:#f29718>argv</span><span>){
+</span><span>
+</span><span>    </span><span style=color:#ff7733>struct</span><span> bpf_link </span><span style=color:#f29668>*</span><span>link </span><span style=color:#f29668>= </span><span style=color:#f29718>NULL</span><span style=color:#bfbab0cc>;
+</span><span>    </span><span style=color:#ff7733>struct</span><span> bpf_program </span><span style=color:#f29668>*</span><span>prog</span><span style=color:#bfbab0cc>;
+</span><span>    </span><span style=color:#ff7733>struct</span><span> bpf_program </span><span style=color:#f29668>*</span><span>tailcall_prog</span><span style=color:#bfbab0cc>;
+</span><span>    </span><span style=color:#ff7733>struct</span><span> bpf_object </span><span style=color:#f29668>*</span><span>obj</span><span style=color:#bfbab0cc>;
+</span><span>
+</span><span>    </span><span style=color:#ff7733>char</span><span> filename[</span><span style=color:#f29718>256</span><span>]</span><span style=color:#bfbab0cc>;
+</span><span>    </span><span style=color:#f07178>snprintf</span><span>(filename</span><span style=color:#bfbab0cc>, </span><span style=color:#ff7733>sizeof</span><span>(filename)</span><span style=color:#bfbab0cc>, </span><span style=color:#c2d94c>"</span><span style=color:#f29718>%s</span><span style=color:#c2d94c>_kern.o"</span><span style=color:#bfbab0cc>,</span><span> argv[</span><span style=color:#f29718>0</span><span>])</span><span style=color:#bfbab0cc>;
+</span><span>
+</span><span>    obj </span><span style=color:#f29668>= </span><span style=color:#ffb454>bpf_object__open_file</span><span>(filename</span><span style=color:#bfbab0cc>, </span><span style=color:#f29718>NULL</span><span>)</span><span style=color:#bfbab0cc>;
+</span><span>    </span><span style=color:#ff7733>if</span><span>(</span><span style=color:#ffb454>libbpf_get_error</span><span>(obj)){
+</span><span>        </span><span style=color:#f07178>fprintf</span><span>(stderr</span><span style=color:#bfbab0cc>, </span><span style=color:#c2d94c>"Error: opening BPF obj file"</span><span>)</span><span style=color:#bfbab0cc>;
+</span><span>        </span><span style=color:#ff7733>return </span><span style=color:#f29718>0</span><span style=color:#bfbab0cc>;
+</span><span>    }
+</span><span>
+</span><span>    prog </span><span style=color:#f29668>= </span><span style=color:#ffb454>bpf_object__find_program_by_name</span><span>(obj</span><span style=color:#bfbab0cc>, </span><span style=color:#c2d94c>"trace_enter_execve"</span><span>)</span><span style=color:#bfbab0cc>;
+</span><span>    </span><span style=color:#ff7733>if</span><span>(</span><span style=color:#f29668>!</span><span>prog){
+</span><span>        </span><span style=color:#f07178>fprintf</span><span>(stderr</span><span style=color:#bfbab0cc>,</span><span style=color:#c2d94c>"finding the prog in the object file failed</span><span style=color:#95e6cb>\n</span><span style=color:#c2d94c>"</span><span>)</span><span style=color:#bfbab0cc>;
+</span><span>        </span><span style=color:#ff7733>goto</span><span> cleanup</span><span style=color:#bfbab0cc>;
+</span><span>    }
+</span><span>
+</span><span>    tailcall_prog </span><span style=color:#f29668>= </span><span style=color:#ffb454>bpf_object__find_program_by_name</span><span>(obj</span><span style=color:#bfbab0cc>, </span><span style=color:#c2d94c>"testing_func_user"</span><span>)</span><span style=color:#bfbab0cc>;
+</span><span>    </span><span style=color:#ff7733>if</span><span>(</span><span style=color:#f29668>!</span><span>prog){
+</span><span>        </span><span style=color:#f07178>fprintf</span><span>(stderr</span><span style=color:#bfbab0cc>,</span><span style=color:#c2d94c>"finding the testing_prog in the object file failed</span><span style=color:#95e6cb>\n</span><span style=color:#c2d94c>"</span><span>)</span><span style=color:#bfbab0cc>;
+</span><span>        </span><span style=color:#ff7733>goto</span><span> cleanup</span><span style=color:#bfbab0cc>;
+</span><span>    }
+</span><span>
+</span><span>    </span><span style=color:#ff7733>if </span><span>(</span><span style=color:#ffb454>bpf_object__load</span><span>(obj)) {
+</span><span>                </span><span style=color:#f07178>fprintf</span><span>(stderr</span><span style=color:#bfbab0cc>, </span><span style=color:#c2d94c>"ERROR: loading BPF object file failed</span><span style=color:#95e6cb>\n</span><span style=color:#c2d94c>"</span><span>)</span><span style=color:#bfbab0cc>;
+</span><span>                </span><span style=color:#ff7733>goto</span><span> cleanup</span><span style=color:#bfbab0cc>;
+</span><span>    }
+</span><span>
+</span><span>    </span><span style=color:#ff7733>char</span><span> pfilename[</span><span style=color:#f29718>256</span><span>]</span><span style=color:#bfbab0cc>;
+</span><span>    </span><span style=color:#ff7733>int</span><span> len </span><span style=color:#f29668>= </span><span style=color:#f07178>snprintf</span><span>(pfilename</span><span style=color:#bfbab0cc>, </span><span style=color:#f29718>256</span><span style=color:#bfbab0cc>, </span><span style=color:#c2d94c>"</span><span style=color:#f29718>%s</span><span style=color:#c2d94c>/</span><span style=color:#f29718>%s</span><span style=color:#c2d94c>"</span><span style=color:#bfbab0cc>,</span><span> BPF_SYSFS_ROOT</span><span style=color:#bfbab0cc>, </span><span style=color:#c2d94c>"tailcall_prog"</span><span>)</span><span style=color:#bfbab0cc>;
+</span><span>    </span><span style=color:#ffb454>bpf_program__pin</span><span>(tailcall_prog</span><span style=color:#bfbab0cc>,</span><span> pfilename)</span><span style=color:#bfbab0cc>;
+</span><span>
+</span><span>
+</span><span>    link </span><span style=color:#f29668>= </span><span style=color:#ffb454>bpf_program__attach</span><span>(prog)</span><span style=color:#bfbab0cc>;
+</span><span>    </span><span style=color:#ff7733>if</span><span>(</span><span style=color:#ffb454>libbpf_get_error</span><span>(link)){
+</span><span>        </span><span style=color:#f07178>fprintf</span><span>(stderr</span><span style=color:#bfbab0cc>, </span><span style=color:#c2d94c>"ERROR: bpf_program__attach failed : </span><span style=color:#f29718>%ld</span><span style=color:#95e6cb>\n</span><span style=color:#c2d94c>"</span><span style=color:#bfbab0cc>, </span><span style=color:#ffb454>libbpf_get_error</span><span>(link))</span><span style=color:#bfbab0cc>;
+</span><span>        link </span><span style=color:#f29668>= </span><span style=color:#f29718>NULL</span><span style=color:#bfbab0cc>;
+</span><span>        </span><span style=color:#ff7733>goto</span><span> cleanup</span><span style=color:#bfbab0cc>;
+</span><span>    }</span><span style=color:#ff7733>else</span><span>{
+</span><span>        </span><span style=color:#f07178>fprintf</span><span>(stderr</span><span style=color:#bfbab0cc>, </span><span style=color:#c2d94c>"Attachment is done</span><span style=color:#95e6cb>\n</span><span style=color:#c2d94c>"</span><span>)</span><span style=color:#bfbab0cc>;
+</span><span>    }
+</span><span>	</span><span style=color:#ff7733>while</span><span>(</span><span style=color:#f29718>1</span><span>)</span><span style=color:#bfbab0cc>;
+</span><span>    </span><span style=color:#ffb454>read_trace_pipe</span><span>()</span><span style=color:#bfbab0cc>;
+</span><span>    </span><span style=color:#59c2ff>cleanup</span><span style=color:#bfbab0cc>:
+</span><span>            </span><span style=color:#ffb454>bpf_link__destroy</span><span>(link)</span><span style=color:#bfbab0cc>;
+</span><span>            </span><span style=color:#ffb454>bpf_object__close</span><span>(obj)</span><span style=color:#bfbab0cc>;
+</span><span>            </span><span style=color:#ff7733>return </span><span style=color:#f29718>0</span><span style=color:#bfbab0cc>;
+</span><span>
+</span><span>}
+</span><span>
+</span></code></pre><p><strong>Userspace Code for updating the map</strong><pre class=language-C data-lang=C style=background:#0f1419;color:#bfbab0><code class=language-C data-lang=C><span style=color:#ff7733>#include </span><span style=color:#c2d94c>&LTerrno.h>
+</span><span style=color:#ff7733>#include </span><span style=color:#c2d94c>&LTstdlib.h>
+</span><span style=color:#ff7733>#include </span><span style=color:#c2d94c>&LTstdio.h>
+</span><span style=color:#ff7733>#include </span><span style=color:#c2d94c>&LTbpf/bpf.h>
+</span><span style=color:#ff7733>#include </span><span style=color:#c2d94c>&LTbpf/libbpf.h>
+</span><span>
+</span><span>
+</span><span style=color:#ff7733>int </span><span style=color:#ffb454>main</span><span>(</span><span style=color:#ff7733>int </span><span style=color:#f29718>argc</span><span style=color:#bfbab0cc>, </span><span style=color:#ff7733>char </span><span style=color:#f29668>**</span><span style=color:#f29718>argv</span><span>)
+</span><span>{
+</span><span>    </span><span style=color:#ff7733>int</span><span> ret </span><span style=color:#f29668>= -</span><span style=color:#f29718>1</span><span style=color:#bfbab0cc>;
+</span><span>    </span><span style=color:#ff7733>const char </span><span style=color:#f29668>*</span><span>pinned_file </span><span style=color:#f29668>= </span><span style=color:#c2d94c>"/sys/fs/bpf/prog_array_init"</span><span style=color:#bfbab0cc>;
+</span><span>    </span><span style=color:#ff7733>const char </span><span style=color:#f29668>*</span><span>pinned_file2 </span><span style=color:#f29668>= </span><span style=color:#c2d94c>"/sys/fs/bpf/tailcall_prog"</span><span style=color:#bfbab0cc>;
+</span><span>
+</span><span>    </span><span style=color:#ff7733>int</span><span> map_fd </span><span style=color:#f29668>= </span><span style=color:#ffb454>bpf_obj_get</span><span>(pinned_file)</span><span style=color:#bfbab0cc>;
+</span><span>    </span><span style=color:#ff7733>if</span><span>(map_fd</span><span style=color:#f29668><</span><span style=color:#f29718>0</span><span>){
+</span><span>        </span><span style=color:#f07178>fprintf</span><span>(stderr</span><span style=color:#bfbab0cc>, </span><span style=color:#c2d94c>"bpf_obj_get(</span><span style=color:#f29718>%s</span><span style=color:#c2d94c>): </span><span style=color:#f29718>%s</span><span style=color:#c2d94c>(</span><span style=color:#f29718>%d</span><span style=color:#c2d94c>)</span><span style=color:#95e6cb>\n</span><span style=color:#c2d94c>"</span><span style=color:#bfbab0cc>,
+</span><span>                pinned_file</span><span style=color:#bfbab0cc>, </span><span style=color:#f07178>strerror</span><span>(errno)</span><span style=color:#bfbab0cc>,</span><span> errno)</span><span style=color:#bfbab0cc>;
+</span><span>        </span><span style=color:#ff7733>goto</span><span> out</span><span style=color:#bfbab0cc>;
+</span><span>    }
+</span><span>
+</span><span>
+</span><span>    </span><span style=color:#ff7733>int</span><span> tail_prog_fd </span><span style=color:#f29668>= </span><span style=color:#ffb454>bpf_obj_get</span><span>(pinned_file2)</span><span style=color:#bfbab0cc>;
+</span><span>    </span><span style=color:#ff7733>int</span><span> key </span><span style=color:#f29668>= </span><span style=color:#f29718>1</span><span style=color:#bfbab0cc>;
+</span><span>    </span><span style=color:#ffb454>bpf_map_update_elem</span><span>(map_fd</span><span style=color:#bfbab0cc>, </span><span style=color:#f29668>&</span><span>key</span><span style=color:#bfbab0cc>, </span><span style=color:#f29668>&</span><span>tail_prog_fd</span><span style=color:#bfbab0cc>, </span><span style=color:#f29718>0</span><span>)</span><span style=color:#bfbab0cc>;
+</span><span>
+</span><span style=color:#59c2ff>out</span><span style=color:#bfbab0cc>:
+</span><span>    </span><span style=color:#ff7733>if</span><span>(map_fd</span><span style=color:#f29668>!= -</span><span style=color:#f29718>1</span><span>)
+</span><span>        </span><span style=color:#ffb454>close</span><span>(map_fd)</span><span style=color:#bfbab0cc>;
+</span><span>    </span><span style=color:#ff7733>return</span><span> ret</span><span style=color:#bfbab0cc>;
+</span><span>
+</span><span>}
+</span></code></pre><h2 id=references>References</h2><p><a href="https://blog.cloudflare.com/assembly-within-bpf-tail-calls-on-x86-and-arm/#:~:text=Tail%20calls%20can%20be%20seen,reusing%20the%20same%20stack%20frame">Cloud Fare Blog by Jakub Sitnicki</a> <br><a href=https://docs.cilium.io/en/stable/bpf/architecture/#tail-calls>Cilium Docs</a><p>I am able to write this blog because of my work in ROSA LAB@Virginia Tech. So I would like to thank Prof Dan Williams and everyone in my lab for your support.</section></article></main></div>
